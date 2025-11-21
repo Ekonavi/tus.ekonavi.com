@@ -25,6 +25,7 @@ import {
 import { R2UploadedPart } from "@cloudflare/workers-types";
 import { ATTACHMENT_PREFIX, BACKUP_PREFIX } from "./constant";
 import { headerStandalone } from "./cors";
+import { generateUploadPath, validatePath } from "./pathGenerator";
 
 export const TUS_VERSION = "1.0.0";
 
@@ -191,14 +192,26 @@ export class UploadHandler {
     const uploadMetadata = parseUploadMetadata(request.headers);
     const checksum = parseChecksum(request.headers);
 
-    const r2Key = this.prefix + "/" + uploadMetadata.filename;
+    // Validate that filename exists in metadata
+    if (!uploadMetadata.filename) {
+      return mutableError(400, "filename required in Upload-Metadata");
+    }
+
+    // Generate server-side path: {prefix}/{serviceId}/{filename}
+    const r2Key = generateUploadPath({
+      prefix: this.prefix,
+      serviceId: serviceId,
+      filename: uploadMetadata.filename,
+    });
+
+    // Validate generated path for security
+    if (!validatePath(r2Key, this.prefix)) {
+      return mutableError(500, "invalid path generated");
+    }
 
     if (!receivedToken) {
       console.log("NO TOKEN_FOUND");
       return mutableError(401, "no token found");
-    }
-    if (r2Key == null) {
-      return mutableError(400, "bad filename metadata");
     }
 
     const existingUploadOffset: number | undefined =
@@ -497,7 +510,7 @@ export class UploadHandler {
             // it directly without using multipart
             await this.r2Put(r2Key, part.bytes, checksum);
             uploadOffset += part.bytes.byteLength;
-
+            console.log("FINISHED_UPLOADING:", r2Key);
             // Send completion message to queue before cleanup
             await this.sendCompletionMessage(r2Key, uploadOffset);
 
@@ -771,6 +784,7 @@ export class UploadHandler {
     try {
       const uploadInfo: StoredUploadInfo | undefined =
         await this.state.storage.get(UPLOAD_INFO_KEY);
+      console.log("SENDING_MESSAGE:", r2Key);
 
       if (!uploadInfo?.serviceId) {
         console.warn(

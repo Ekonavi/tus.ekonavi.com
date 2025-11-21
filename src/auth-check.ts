@@ -4,6 +4,7 @@ import { Auth, createAuth } from "./auth";
 import { mutableError } from "./util";
 import { parseUploadMetadata } from "./parse";
 import { Buffer } from "node:buffer";
+import { generateUploadPath } from "./pathGenerator";
 // lazy init because it requires env but is expensive to create
 export let auth: Auth | undefined;
 
@@ -105,8 +106,15 @@ export function withAuthorizedKeyFromPath(prefix?: string) {
     env: Env,
     _ctx: ExecutionContext
   ): Response | undefined => {
+    const key = (prefix ?? "") + `${request.params.id}`;
+
+    // Validate path doesn't contain traversal attempts or dangerous patterns
+    if (key.includes('..') || key.includes('//') || key.includes('\\')) {
+      return mutableError(400, "invalid path");
+    }
+
     return setAuthorizedKey(
-      { keyExtractor: (request) => (prefix ?? "") + `${request.params.id}` },
+      { keyExtractor: (_) => key },
       request,
       env
     );
@@ -118,10 +126,34 @@ export function withAuthorizedKeyFromMetadata(prefix = "") {
     env: Env,
     _ctx: ExecutionContext
   ): Response | undefined => {
+    const metadata = parseUploadMetadata(request.headers);
+    if (!metadata.filename) {
+      return mutableError(400, "filename required in Upload-Metadata");
+    }
+
+    // Extract serviceId from query parameters (if present - used for attachments)
+    const url = new URL(request.url);
+    const serviceId = url.searchParams.get("serviceId");
+
+    let key: string;
+
+    if (serviceId) {
+      // For attachments with serviceId: generate hierarchical path
+      // Format: {prefix}/{serviceId}/{filename}
+      key = generateUploadPath({
+        prefix: prefix.replace(/\/$/, ""), // Remove trailing slash if present
+        serviceId: serviceId,
+        filename: metadata.filename,
+      });
+    } else {
+      // For backups without serviceId: use old flat format
+      // Format: {prefix}{filename}
+      key = prefix + metadata.filename;
+    }
+
     return setAuthorizedKey(
       {
-        keyExtractor: (request) =>
-          prefix + parseUploadMetadata(request.headers).filename,
+        keyExtractor: (_) => key,
       },
       request,
       env
@@ -183,7 +215,17 @@ export function withUnauthenticatedKeyFromId(
   _env: Env,
   _ctx: ExecutionContext
 ): Response | undefined {
-  request.key = request.params.id;
+  // For GET requests, we need to prepend the namespace to construct the full R2 key
+  // Example: URL /attachments/serviceId/file.pdf
+  // - request.params.id = "serviceId/file.pdf"
+  // - request.namespace.name = "attachments"
+  // - Result: request.key = "attachments/serviceId/file.pdf"
+  const namespace = request.namespace?.name;
+  if (namespace) {
+    request.key = `${namespace}/${request.params.id}`;
+  } else {
+    request.key = request.params.id;
+  }
   return;
 }
 export interface AuthOptions {
